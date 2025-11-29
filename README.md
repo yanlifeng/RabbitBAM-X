@@ -76,10 +76,12 @@ After building, the executable `RabbitBAM-X` will be in the build directory.
 When running on Sunway platform using `bsub`, you need to set the `LD_LIBRARY_PATH` environment variable:
 
 ```bash
-bsub -q q_sw_expr -I -b -J test -N 1 -np 1 -cgsp 64 -share_size 12000 -cache_size 128 \
+bsub -q q_sw_expr -I -b -J test -N 1 -np 1 -cgsp 64 -share_size 12000 -cache_size 32 \
      -o output.log \
      -x LD_LIBRARY_PATH=./ext/htslib-1.20:./ext/libdeflate-1.20/build \
      ./RabbitBAM-X api_test -i input.bam -o output.bam --nr 1 --nw 1
+
+note: sunway platform only support compress level = 1 with cache_size = 32KB && sunway_api_test para with --tgs
 ```
 
 Note: The `-x LD_LIBRARY_PATH=./ext/htslib-1.20:./ext/libdeflate-1.20/build` parameter is required for Sunway platform to locate the shared libraries.
