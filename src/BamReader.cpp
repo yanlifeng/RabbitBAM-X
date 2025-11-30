@@ -5,8 +5,7 @@
 #include <athread.h>
 #include <mutex>
 // Forward declaration for slave function (C linkage)
-extern "C" void slave_block_process(void *arg);
-extern "C" void slave_write_compress_process(void *arg);
+extern "C" void slave_read_process(void *arg);
 // Global mutex to coordinate reader and writer spawn
 std::mutex g_athread_spawn_mutex;
 // BlockProcessData structure for passing data to slave cores
@@ -100,7 +99,7 @@ void compress_pack(BamRead *read, BamCompress *compress) {
         // Spawn slave cores for parallel processing (with mutex to coordinate with writer)
         {
             std::lock_guard<std::mutex> lock(g_athread_spawn_mutex);
-            __real_athread_spawn((void *)slave_block_process, process_data, 1);
+            __real_athread_spawn((void *)slave_read_process, process_data, 1);
         }
         
         // Wait for all slave cores to complete

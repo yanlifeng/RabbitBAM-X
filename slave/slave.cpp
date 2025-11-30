@@ -5,50 +5,26 @@
 #include <climits>
 #include <cassert>
 
-// athread.h is available on Sunway platform
 #ifdef PLATFORM_SUNWAY
 #include <slave.h>
 #endif
 
-// BlockProcessData structure for passing data to slave cores
-// Simplified structure: only pointers, lengths, CRC, and result pair
 struct BlockProcessData {
-    const uint8_t *compressed_data;    // Aligned compressed data (comp->data + 18)
-    size_t compressed_len;              // Compressed data length
-    uint8_t *uncompressed_data;         // Aligned uncompressed data buffer
-    size_t uncompressed_len;             // Uncompressed data buffer size (input) / actual size (output)
-    uint32_t expected_crc;              // Pre-computed CRC
-    std::pair<int, int> *result_pair;   // Result: (split_pos, bam_number)
+    const uint8_t *compressed_data;
+    size_t compressed_len;
+    uint8_t *uncompressed_data;
+    size_t uncompressed_len;
+    uint32_t expected_crc;
+    std::pair<int, int> *result_pair;
 };
 
-// Helper function: le_to_u32 (slave core version with safe unaligned access)
-// This version uses byte-by-byte reading to avoid alignment issues on Sunway slave cores
-static inline uint32_t le_to_u32_slave(const uint8_t *buf) {
-    // Read 4 bytes in little-endian order, safe for unaligned access
-    return ((uint32_t) buf[0] |
-            ((uint32_t) buf[1] << 8) |
-            ((uint32_t) buf[2] << 16) |
-            ((uint32_t) buf[3] << 24));
-}
-
-// Helper function: Rabbit_memcpy (local implementation for slave core)
-inline void Rabbit_memcpy_slave(void *target, unsigned char *source, unsigned int length) {
-    memcpy((uint8_t *) target, source, length);
-}
-
-// Helper function: bgzf_uncompress (simplified version for slave core)
-// Note: libdeflate functions are available on slave cores
-// Sunway slave cores require 64-byte alignment for memory access
-// Data should already be aligned by host core before calling this function
-int bgzf_uncompress_slave(uint8_t *dst, size_t *dlen, const uint8_t *src, size_t slen, uint32_t expected_crc) {
-    // Check alignment for Sunway slave cores (64-byte alignment required)
-    const uintptr_t ALIGN_MASK = 63;  // 64-byte alignment mask
+// BGZF decompression for slave core
+int slave_bgzf_decompress(uint8_t *dst, size_t *dlen, const uint8_t *src, size_t slen, uint32_t expected_crc) {
+    const uintptr_t ALIGN_MASK = 63;
     if (((uintptr_t)src & ALIGN_MASK) != 0 || ((uintptr_t)dst & ALIGN_MASK) != 0) {
-        // Alignment check failed - this should not happen if host core prepared data correctly
         return -1;
     }
     
-    // Use libdeflate functions available on slave cores (from libdeflate.h)
     struct libdeflate_decompressor *z = libdeflate_alloc_decompressor();
     if (!z) {
         return -1;
@@ -72,40 +48,30 @@ int bgzf_uncompress_slave(uint8_t *dst, size_t *dlen, const uint8_t *src, size_t
     return 0;
 }
 
-// block_decode_func_slave implementation using simplified data structure
-// This version takes aligned pointers directly, CRC is pre-computed
-int block_decode_func_slave_simple(const uint8_t *compressed_data, size_t compressed_len,
-                                    uint8_t *uncompressed_data, size_t *uncompressed_len,
-                                    uint32_t expected_crc) {
-    // Decompress using pre-aligned data and pre-computed CRC
-    // printf("compressed data pointer: %p\n", compressed_data);
-    // printf("compressed data length: %zu\n", compressed_len);
-    // printf("Uncompressed data pointer: %p\n", uncompressed_data);
-    // printf("Uncompressed data length: %zu\n", *uncompressed_len);
-    int ret = bgzf_uncompress_slave(uncompressed_data, uncompressed_len,
-                                     compressed_data, compressed_len, expected_crc);
-    return ret;
+int slave_block_decompress(const uint8_t *compressed_data, size_t compressed_len,
+                           uint8_t *uncompressed_data, size_t *uncompressed_len,
+                           uint32_t expected_crc) {
+    return slave_bgzf_decompress(uncompressed_data, uncompressed_len,
+                                  compressed_data, compressed_len, expected_crc);
 }
 
-// find_divide_pos_and_get_read_number implementation for slave core
-std::pair<int, int> find_divide_pos_and_get_read_number_slave(bam_block *block, int last_pos) {
+std::pair<int, int> slave_find_divide_pos(bam_block *block, int last_pos) {
     int divide_pos = last_pos;
     int ans = 0;
     int ret = 0;
     uint32_t x[8], new_l_data;
     while (divide_pos < block->length) {
-        Rabbit_memcpy_slave(&ret, block->data + divide_pos, 4);
+        memcpy(&ret, block->data + divide_pos, 4);
         if (ret >= 32) {
             if (divide_pos + 4 + 32 > block->length) {
                 break;
             }
-            Rabbit_memcpy_slave(x, block->data + divide_pos + 4, 32);
-            int pos = (int32_t) x[1];
+            memcpy(x, block->data + divide_pos + 4, 32);
             int l_qname = x[2] & 0xff;
             int l_extranul = (l_qname % 4 != 0) ? (4 - l_qname % 4) : 0;
             int n_cigar = x[3] & 0xffff;
             int l_qseq = x[4];
-            new_l_data = ret - 32 + l_extranul;//block_len + c->l_extranul
+            new_l_data = ret - 32 + l_extranul;
             if (new_l_data > INT_MAX || l_qseq < 0 || l_qname < 1) {
                 divide_pos += 4 + 32;
                 continue;
@@ -119,7 +85,7 @@ std::pair<int, int> find_divide_pos_and_get_read_number_slave(bam_block *block, 
                 break;
             }
             char fg_char;
-            Rabbit_memcpy_slave(&fg_char, block->data + divide_pos + 4 + 32 + l_qname - 1, 1);
+            memcpy(&fg_char, block->data + divide_pos + 4 + 32 + l_qname - 1, 1);
             if (fg_char != '\0' && l_extranul <= 0 && new_l_data > INT_MAX - 4) {
                 if (divide_pos + 4 + 32 + l_qname > block->length) {
                     break;
@@ -143,80 +109,85 @@ std::pair<int, int> find_divide_pos_and_get_read_number_slave(bam_block *block, 
     return std::pair<int, int>(divide_pos, ans);
 }
 
-// Slave core function for parallel block processing
-// Note: This function is compiled with -mslave flag for slave cores
-extern "C" void slave_block_process(void *arg) {
-    // Convert arg to BlockProcessData array pointer, then access element using _PEN
+extern "C" void read_process(void *arg) {
     BlockProcessData* array = (BlockProcessData *)arg;
     BlockProcessData* data = &array[_PEN];
     
-    
-    // Create temporary bam_block structure for find_divide_pos_and_get_read_number_slave
-    // (it expects a bam_block*, but we only have data pointer and length)
     bam_block temp_block;
     temp_block.data = data->uncompressed_data;
     temp_block.length = BGZF_MAX_BLOCK_SIZE;
     temp_block.pos = 0;
     
-    // Parallel decode using simplified interface
-    int ret = block_decode_func_slave_simple(data->compressed_data, data->compressed_len,
-                                              data->uncompressed_data, &data->uncompressed_len,
-                                              data->expected_crc);
+    int ret = slave_block_decompress(data->compressed_data, data->compressed_len,
+                                      data->uncompressed_data, &data->uncompressed_len,
+                                      data->expected_crc);
     if (ret) {
         assert(false);
         return;
     }
-    // Update temp_block length after decompression
-    temp_block.length = data->uncompressed_len;
     
-    // Parallel pre-parse
-    *(data->result_pair) = find_divide_pos_and_get_read_number_slave(&temp_block, 0);
+    temp_block.length = data->uncompressed_len;
+    *(data->result_pair) = slave_find_divide_pos(&temp_block, 0);
 }
 
-// WriteCompressData structure for passing write block compression data to slave cores
-struct WriteCompressData {
-    uint8_t *uncompressed_data;      // Uncompressed data buffer (aligned)
-    size_t uncompressed_len;          // Uncompressed data length
-    uint8_t *compressed_data;         // Compressed data buffer (aligned)
-    size_t *compressed_len;           // Compressed data length (output)
-    int compress_level;                // Compression level
-};
-
-// Slave core function for parallel write block compression
-extern "C" void slave_write_compress_process(void *arg) {
-    WriteCompressData* array = (WriteCompressData *)arg;
-    WriteCompressData* data = &array[_PEN];
-    // Check alignment for Sunway slave cores (64-byte alignment required)
+int slave_bgzf_compress(uint8_t *uncompressed_data, size_t uncompressed_len,
+                        uint8_t *deflate_buffer, size_t *deflate_len,
+                        int compress_level) {
     const uintptr_t ALIGN_MASK = 63;
-    if (((uintptr_t)data->uncompressed_data & ALIGN_MASK) != 0 || 
-        ((uintptr_t)data->compressed_data & ALIGN_MASK) != 0) {
-        // Alignment check failed
-        *(data->compressed_len) = 0;
-        return;
+    if (((uintptr_t)uncompressed_data & ALIGN_MASK) != 0 || 
+        ((uintptr_t)deflate_buffer & ALIGN_MASK) != 0) {
+        *deflate_len = 0;
+        return -1;
     }
     
-    // Skip if input size is 0
-    if (data->uncompressed_len == 0) {
-        *(data->compressed_len) = 0;
-        return;
+    if (uncompressed_len == 0) {
+        *deflate_len = 0;
+        return 0;
     }
     
-    // Use libdeflate compressor with gzip format
-    struct libdeflate_compressor *compressor = libdeflate_alloc_compressor(data->compress_level);
+    struct libdeflate_compressor *compressor = libdeflate_alloc_compressor(compress_level);
     if (!compressor) {
-        *(data->compressed_len) = 0;
-        return;
+        *deflate_len = 0;
+        return -1;
     }
     
-    // Get compressed size bound for gzip format
-    size_t bound = libdeflate_gzip_compress_bound(compressor, data->uncompressed_len);
-    
-    // Perform gzip compression
-    size_t out_size = libdeflate_gzip_compress(compressor, data->uncompressed_data, data->uncompressed_len,
-                                               data->compressed_data, bound);
+    // Compress to DEFLATE format (raw DEFLATE, not gzip)
+    // Same as main core: compress to buffer, host will add BGZF header/footer
+    size_t deflate_bound = libdeflate_deflate_compress_bound(compressor, uncompressed_len);
+    size_t deflate_out_size = libdeflate_deflate_compress(compressor, uncompressed_data, uncompressed_len,
+                                                          deflate_buffer, deflate_bound);
     
     libdeflate_free_compressor(compressor);
     
-    // Set output size (0 if compression failed)
-    *(data->compressed_len) = out_size;
+    if (deflate_out_size == 0) {
+        *deflate_len = 0;
+        return -1;
+    }
+    
+    *deflate_len = deflate_out_size;
+    return 0;
+}
+
+int slave_block_compress(uint8_t *uncompressed_data, size_t uncompressed_len,
+                         uint8_t *deflate_buffer, size_t *deflate_len,
+                         int compress_level) {
+    return slave_bgzf_compress(uncompressed_data, uncompressed_len,
+                                deflate_buffer, deflate_len, compress_level);
+}
+
+struct WriteCompressData {
+    uint8_t *uncompressed_data;
+    size_t uncompressed_len;
+    uint8_t *deflate_buffer;
+    size_t *deflate_len;
+    int compress_level;
+};
+
+extern "C" void slave_write_process(void *arg) {
+    WriteCompressData* array = (WriteCompressData *)arg;
+    WriteCompressData* data = &array[_PEN];
+    
+    slave_block_compress(data->uncompressed_data, data->uncompressed_len,
+                         data->deflate_buffer, data->deflate_len,
+                         data->compress_level);
 }

@@ -3,16 +3,15 @@
 #ifdef PLATFORM_SUNWAY
 #include <athread.h>
 #include <mutex>
-// Forward declaration for slave function (C linkage)
-extern "C" void slave_write_compress_process(void *arg);
+extern "C" void slave_write_process(void *arg);
 // External mutex from BamReader.cpp
 extern std::mutex g_athread_spawn_mutex;
 // WriteCompressData structure (must match slave/slave.cpp)
 struct WriteCompressData {
     uint8_t *uncompressed_data;
     size_t uncompressed_len;
-    uint8_t *compressed_data;
-    size_t *compressed_len;
+    uint8_t *deflate_buffer;
+    size_t *deflate_len;
     int compress_level;
 };
 #endif
@@ -200,10 +199,12 @@ void bam_write_compress_pack_sunway(BGZF *fp, BamWriteCompress *bam_write_compre
             }
             
             // Fill WriteCompressData structure
+            // From slave core: compress DEFLATE data to aligned buffer (compressed_data is 64-byte aligned)
+            // Host core will copy DEFLATE data to compressed_data + BLOCK_HEADER_LENGTH and add header/footer
             process_data[batch_count].uncompressed_data = blocks[batch_count]->uncompressed_data;
             process_data[batch_count].uncompressed_len = blocks[batch_count]->block_offset;
-            process_data[batch_count].compressed_data = blocks[batch_count]->compressed_data;
-            process_data[batch_count].compressed_len = &compressed_lens[batch_count];  // Use temporary size_t array
+            process_data[batch_count].deflate_buffer = blocks[batch_count]->compressed_data;  // Use aligned start of buffer
+            process_data[batch_count].deflate_len = &compressed_lens[batch_count];
             process_data[batch_count].compress_level = fp->compress_level;
             
             batch_count++;
@@ -219,18 +220,47 @@ void bam_write_compress_pack_sunway(BGZF *fp, BamWriteCompress *bam_write_compre
         // Spawn slave cores for parallel compression (with mutex to coordinate with reader)
         {
             std::lock_guard<std::mutex> lock(g_athread_spawn_mutex);
-            __real_athread_spawn((void *)slave_write_compress_process, process_data, 1);
+            __real_athread_spawn((void *)slave_write_process, process_data, 1);
         }
         
         // Wait for all slave cores to complete
         athread_join();
         
-        // Process results - convert size_t back to int
+        // Process results - assemble complete BGZF block from slave core DEFLATE data
         for (int i = 0; i < batch_count; i++) {
-            blocks[i]->block_length = (int)compressed_lens[i];  // Convert size_t to int
-            if (blocks[i]->block_length > 0) {
-                bam_write_compress->inputCompressData(blocks[i]);
+            size_t deflate_len = compressed_lens[i];
+            if (deflate_len == 0) {
+                blocks[i]->block_length = -1;
+                continue;
             }
+            
+            uint8_t *dst = blocks[i]->compressed_data;
+            size_t uncompressed_len = blocks[i]->block_offset;
+            
+            // Slave core compressed DEFLATE data to the start of compressed_data (64-byte aligned)
+            // Now we need to: 1) Copy DEFLATE data to correct position, 2) Add header, 3) Add footer
+            // Copy DEFLATE data first (from offset 0 to offset 18) - use memmove for overlapping regions
+            uint8_t *deflate_src = dst;  // Slave core compressed here
+            uint8_t *deflate_dst = dst + BLOCK_HEADER_LENGTH;  // Final position
+            // memmove handles overlapping correctly (copying from back to front when dst > src)
+            if (deflate_dst != deflate_src) {
+                memmove(deflate_dst, deflate_src, deflate_len);
+            }
+            
+            // Add BGZF header (this won't overwrite DEFLATE data since header is only 18 bytes)
+            memcpy(dst, g_magic, BLOCK_HEADER_LENGTH);
+            
+            // Calculate total block length (header + deflate data + footer)
+            size_t total_len = deflate_len + BLOCK_HEADER_LENGTH + BLOCK_FOOTER_LENGTH;
+            packInt16(&dst[16], total_len - 1);
+            
+            // Add BGZF footer
+            uint32_t crc = libdeflate_crc32(0, blocks[i]->uncompressed_data, uncompressed_len);
+            packInt32(&dst[total_len - 8], crc);
+            packInt32(&dst[total_len - 4], uncompressed_len);
+            
+            blocks[i]->block_length = (int)total_len;
+            bam_write_compress->inputCompressData(blocks[i]);
         }
         batch_id++;
     }

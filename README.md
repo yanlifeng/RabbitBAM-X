@@ -95,7 +95,3 @@ Yan, L., Zhao, Z., Yin, Z., Zhang, T., Yang, Y., Zhu, F., ... & Liu, W. (2025).
 RabbitBAM: Accelerating BAM File Manipulation on Multi-Core Platforms. 
 IEEE Transactions on Computational Biology and Bioinformatics.
 ```
-
-## License
-
-[Add your license information here]
