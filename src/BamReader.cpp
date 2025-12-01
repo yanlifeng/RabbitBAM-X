@@ -18,6 +18,12 @@ struct BlockProcessData {
     uint32_t expected_crc;              // Pre-computed CRC
     std::pair<int, int> *result_pair;   // Result: (split_pos, bam_number)
 };
+
+// Wrapper structure to pass batch count along with data array
+struct BlockProcessDataWrapper {
+    BlockProcessData *data_array;
+    int batch_count;
+};
 #endif
 
 void read_pack(BGZF *fp, BamRead *read) {
@@ -34,7 +40,7 @@ void read_pack(BGZF *fp, BamRead *read) {
 #ifdef PLATFORM_SUNWAY
 // Sunway version: parallel processing with athread
 void compress_pack(BamRead *read, BamCompress *compress) {
-    const int BATCH_SIZE = 64;
+    const int BATCH_SIZE = 64 * 16;
     pair<bam_block *, int> comp;
     bam_block *compressed_blocks[BATCH_SIZE];
     bam_block *uncompressed_blocks[BATCH_SIZE];
@@ -52,7 +58,7 @@ void compress_pack(BamRead *read, BamCompress *compress) {
     double all_t_start = GetTime();
     
     while (has_more_data) {
-        // Collect blocks until we have 64 or reach end
+        // Collect blocks until we have 64*16 (1024) or reach end
         batch_count = 0;
         while (batch_count < BATCH_SIZE) {
             comp = read->getReadBlock();
@@ -99,7 +105,10 @@ void compress_pack(BamRead *read, BamCompress *compress) {
         // Spawn slave cores for parallel processing (with mutex to coordinate with writer)
         {
             std::lock_guard<std::mutex> lock(g_athread_spawn_mutex);
-            __real_athread_spawn((void *)slave_read_process, process_data, 1);
+            BlockProcessDataWrapper wrapper;
+            wrapper.data_array = process_data;
+            wrapper.batch_count = batch_count;
+            __real_athread_spawn((void *)slave_read_process, &wrapper, 1);
         }
         
         // Wait for all slave cores to complete

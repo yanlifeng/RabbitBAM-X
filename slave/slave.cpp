@@ -9,6 +9,25 @@
 #include <slave.h>
 #endif
 
+#define use_dynamic_task
+
+#define cpe_num_slave 64
+#define global_pen (_PEN)
+
+#ifdef use_dynamic_task
+//__uncached __cross long work_counter;
+__uncached long work_counter;
+
+int acquire_task(int block_num) {
+    int cur_id;
+    asm volatile("faal %0, 0(%1)\n\t"
+                 : "=r"(cur_id)
+                 : "r"(&work_counter)
+                 : "memory");
+    return cur_id;
+}
+#endif
+
 struct BlockProcessData {
     const uint8_t *compressed_data;
     size_t compressed_len;
@@ -16,6 +35,12 @@ struct BlockProcessData {
     size_t uncompressed_len;
     uint32_t expected_crc;
     std::pair<int, int> *result_pair;
+};
+
+// Wrapper structure to pass batch count along with data array
+struct BlockProcessDataWrapper {
+    BlockProcessData *data_array;
+    int batch_count;
 };
 
 // BGZF decompression for slave core
@@ -109,25 +134,61 @@ std::pair<int, int> slave_find_divide_pos(bam_block *block, int last_pos) {
     return std::pair<int, int>(divide_pos, ans);
 }
 
-extern "C" void read_process(void *arg) {
-    BlockProcessData* array = (BlockProcessData *)arg;
-    BlockProcessData* data = &array[_PEN];
+extern "C" void slave_read_process(void *arg) {
+    BlockProcessDataWrapper* wrapper = (BlockProcessDataWrapper *)arg;
+    BlockProcessData* array = wrapper->data_array;
+    int batch_count = wrapper->batch_count;
     
-    bam_block temp_block;
-    temp_block.data = data->uncompressed_data;
-    temp_block.length = BGZF_MAX_BLOCK_SIZE;
-    temp_block.pos = 0;
+#ifdef use_dynamic_task
+    if(global_pen == 0) work_counter = 0;
+    athread_ssync_array();
     
-    int ret = slave_block_decompress(data->compressed_data, data->compressed_len,
-                                      data->uncompressed_data, &data->uncompressed_len,
-                                      data->expected_crc);
-    if (ret) {
-        assert(false);
-        return;
+    int block_num = batch_count;
+    for(int i = acquire_task(block_num); i < block_num; i = acquire_task(block_num)) {
+        BlockProcessData* data = &array[i];
+        
+        bam_block temp_block;
+        temp_block.data = data->uncompressed_data;
+        temp_block.length = BGZF_MAX_BLOCK_SIZE;
+        temp_block.pos = 0;
+        
+        int ret = slave_block_decompress(data->compressed_data, data->compressed_len,
+                                          data->uncompressed_data, &data->uncompressed_len,
+                                          data->expected_crc);
+        if (ret) {
+            assert(false);
+            continue;
+        }
+        
+        temp_block.length = data->uncompressed_len;
+        *(data->result_pair) = slave_find_divide_pos(&temp_block, 0);
     }
+#else
+    // Static allocation: each slave core processes 16 tasks
+    int tasks_per_core = batch_count / cpe_num_slave;
+    int start_task = global_pen * tasks_per_core;
+    int end_task = (global_pen == cpe_num_slave - 1) ? batch_count : (global_pen + 1) * tasks_per_core;
     
-    temp_block.length = data->uncompressed_len;
-    *(data->result_pair) = slave_find_divide_pos(&temp_block, 0);
+    for(int i = start_task; i < end_task; i++) {
+        BlockProcessData* data = &array[i];
+        
+        bam_block temp_block;
+        temp_block.data = data->uncompressed_data;
+        temp_block.length = BGZF_MAX_BLOCK_SIZE;
+        temp_block.pos = 0;
+        
+        int ret = slave_block_decompress(data->compressed_data, data->compressed_len,
+                                          data->uncompressed_data, &data->uncompressed_len,
+                                          data->expected_crc);
+        if (ret) {
+            assert(false);
+            continue;
+        }
+        
+        temp_block.length = data->uncompressed_len;
+        *(data->result_pair) = slave_find_divide_pos(&temp_block, 0);
+    }
+#endif
 }
 
 int slave_bgzf_compress(uint8_t *uncompressed_data, size_t uncompressed_len,
@@ -183,11 +244,41 @@ struct WriteCompressData {
     int compress_level;
 };
 
+// Wrapper structure to pass batch count along with data array
+struct WriteCompressDataWrapper {
+    WriteCompressData *data_array;
+    int batch_count;
+};
+
 extern "C" void slave_write_process(void *arg) {
-    WriteCompressData* array = (WriteCompressData *)arg;
-    WriteCompressData* data = &array[_PEN];
+    WriteCompressDataWrapper* wrapper = (WriteCompressDataWrapper *)arg;
+    WriteCompressData* array = wrapper->data_array;
+    int batch_count = wrapper->batch_count;
     
-    slave_block_compress(data->uncompressed_data, data->uncompressed_len,
-                         data->deflate_buffer, data->deflate_len,
-                         data->compress_level);
+#ifdef use_dynamic_task
+    if(global_pen == 0) work_counter = 0;
+    athread_ssync_array();
+    
+    int block_num = batch_count;
+    for(int i = acquire_task(block_num); i < block_num; i = acquire_task(block_num)) {
+        WriteCompressData* data = &array[i];
+        
+        slave_block_compress(data->uncompressed_data, data->uncompressed_len,
+                             data->deflate_buffer, data->deflate_len,
+                             data->compress_level);
+    }
+#else
+    // Static allocation: each slave core processes 16 tasks
+    int tasks_per_core = batch_count / cpe_num_slave;
+    int start_task = global_pen * tasks_per_core;
+    int end_task = (global_pen == cpe_num_slave - 1) ? batch_count : (global_pen + 1) * tasks_per_core;
+    
+    for(int i = start_task; i < end_task; i++) {
+        WriteCompressData* data = &array[i];
+        
+        slave_block_compress(data->uncompressed_data, data->uncompressed_len,
+                             data->deflate_buffer, data->deflate_len,
+                             data->compress_level);
+    }
+#endif
 }

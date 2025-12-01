@@ -14,6 +14,12 @@ struct WriteCompressData {
     size_t *deflate_len;
     int compress_level;
 };
+
+// Wrapper structure to pass batch count along with data array
+struct WriteCompressDataWrapper {
+    WriteCompressData *data_array;
+    int batch_count;
+};
 #endif
 
 int rabbit_write_deflate_block(BGZF *fp, bam_write_block *write_block) {
@@ -177,7 +183,7 @@ int bam_write_pack(BGZF *fp, BamWriteCompress *bam_write_compress) {
 #ifdef PLATFORM_SUNWAY
 // Sunway version: batch compression with slave cores
 void bam_write_compress_pack_sunway(BGZF *fp, BamWriteCompress *bam_write_compress) {
-    const int BATCH_SIZE = 64;
+    const int BATCH_SIZE = 64 * 16;
     bam_write_block *blocks[BATCH_SIZE];
     WriteCompressData process_data[BATCH_SIZE];
     size_t compressed_lens[BATCH_SIZE];  // Temporary array for size_t values
@@ -189,7 +195,7 @@ void bam_write_compress_pack_sunway(BGZF *fp, BamWriteCompress *bam_write_compre
     printf("DEBUG bam_write_compress_pack_sunway Compression thread started\n");
 #endif
     while (has_more_data) {
-        // Collect blocks until we have 64 or reach end
+        // Collect blocks until we have 64*16 (1024) or reach end
         batch_count = 0;
         while (batch_count < BATCH_SIZE) {
             blocks[batch_count] = bam_write_compress->getUnCompressData();
@@ -220,7 +226,10 @@ void bam_write_compress_pack_sunway(BGZF *fp, BamWriteCompress *bam_write_compre
         // Spawn slave cores for parallel compression (with mutex to coordinate with reader)
         {
             std::lock_guard<std::mutex> lock(g_athread_spawn_mutex);
-            __real_athread_spawn((void *)slave_write_process, process_data, 1);
+            WriteCompressDataWrapper wrapper;
+            wrapper.data_array = process_data;
+            wrapper.batch_count = batch_count;
+            __real_athread_spawn((void *)slave_write_process, &wrapper, 1);
         }
         
         // Wait for all slave cores to complete
